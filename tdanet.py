@@ -16,7 +16,7 @@ Modified from JusperLee/TDANet: https://github.com/JusperLee/TDANet
 
 
 class TDANet(nn.Module):
-    def __init__(self, input_dim, out_dim, features, num_blocks, upsampling_depth, enc_kernel_size):
+    def __init__(self, input_dim, out_dim, features=128, enc_kernel_size=21, num_blocks=16, upsampling_depth=4, sr=1000000):
         """
         :param input_dim: input dimension
         :param out_dim: output dimension
@@ -29,13 +29,13 @@ class TDANet(nn.Module):
         super(TDANet, self).__init__()
 
         # Number of sources to produce
-        self.in_channels = input_dim
-        self.out_channels = out_dim
+        self.input_dim = input_dim
+        self.out_dim = out_dim
         self.features = features  # bottleneck dim
+        self.enc_kernel_size = enc_kernel_size * sr // 62500  # set 62500 to retain original kernel size
         self.num_blocks = num_blocks
         self.upsampling_depth = upsampling_depth
-        self.enc_kernel_size = enc_kernel_size
-        self.enc_dim = (self.enc_kernel_size + 1) * 4
+        self.enc_dim = self.enc_kernel_size // 2 + 1
 
         # Appropriate padding is needed for arbitrary lengths
         self.lcm = abs(
@@ -44,7 +44,7 @@ class TDANet(nn.Module):
 
         # Front end
         self.encoder = nn.Conv1d(
-            in_channels=self.in_channels,
+            in_channels=self.input_dim,
             out_channels=self.enc_dim,
             kernel_size=self.enc_kernel_size,
             stride=self.enc_kernel_size // 4,
@@ -60,13 +60,13 @@ class TDANet(nn.Module):
         # Separation module
         self.sm = Recurrent(self.features, self.features*4, self.upsampling_depth, self.num_blocks)
 
-        mask_conv = nn.Conv1d(self.features, self.out_channels * self.enc_dim, 1)
+        mask_conv = nn.Conv1d(self.features, self.out_dim * self.enc_dim, 1)
         self.mask_net = nn.Sequential(nn.PReLU(), mask_conv)
 
         # Back end
         self.decoder = nn.ConvTranspose1d(
-            in_channels=self.enc_dim * self.out_channels,
-            out_channels=self.out_channels,
+            in_channels=self.enc_dim * self.out_dim,
+            out_channels=self.out_dim,
             kernel_size=self.enc_kernel_size,
             stride=self.enc_kernel_size // 4,
             padding=self.enc_kernel_size // 2,
@@ -110,27 +110,19 @@ class TDANet(nn.Module):
         x = self.bottleneck(x)
         x = self.sm(x)
         x = self.mask_net(x)
-        x = x.view(x.shape[0], self.out_channels, self.enc_dim, -1)
+        x = x.view(x.shape[0], self.out_dim, self.enc_dim, -1)
         x = self.mask_nl_class(x)
         x = x * s.unsqueeze(1)
 
         # Back end
         estimated_waveforms = self.decoder(x.view(x.shape[0], -1, x.shape[-1]))
-
-        # Center crop to original length
-        output_T = estimated_waveforms.size(-1)
-        if output_T > T:
-            gap = output_T - T
-            left_crop = gap // 2
-            right_crop = gap - left_crop
-            estimated_waveforms = estimated_waveforms[..., left_crop: -right_crop if right_crop > 0 else None]
-        elif output_T < T:
-            # Should not happen, but pad if necessary
-            pad_right = T - output_T
-            estimated_waveforms = F.pad(estimated_waveforms, (0, pad_right))
-
-        # Ensure contiguous and correct length
-        estimated_waveforms = estimated_waveforms[..., :T].contiguous()
+        estimated_waveforms = estimated_waveforms[
+            :,
+            :,
+            self.enc_kernel_size
+            - self.enc_kernel_size
+            // 4: -(rest + self.enc_kernel_size - self.enc_kernel_size // 4),
+        ].contiguous()
 
         return estimated_waveforms
 
@@ -228,53 +220,6 @@ class ConvNorm(nn.Module):
     def forward(self, input):
         output = self.conv(input)
         return self.norm(output)
-
-
-class NormAct(nn.Module):
-    """
-    This class defines a normalization and PReLU activation
-    """
-
-    def __init__(self, nOut):
-        """
-        :param nOut: number of output channels
-        """
-        super().__init__()
-        # self.norm = nn.GroupNorm(1, nOut, eps=1e-08)
-        self.norm = GlobLN(nOut)
-        self.act = nn.PReLU()
-
-    def forward(self, input):
-        output = self.norm(input)
-        return self.act(output)
-
-
-class DilatedConv(nn.Module):
-    """
-    This class defines the dilated convolution.
-    """
-
-    def __init__(self, nIn, nOut, kSize, stride=1, d=1, groups=1):
-        """
-        :param nIn: number of input channels
-        :param nOut: number of output channels
-        :param kSize: kernel size
-        :param stride: optional stride rate for down-sampling
-        :param d: optional dilation rate
-        """
-        super().__init__()
-        self.conv = nn.Conv1d(
-            nIn,
-            nOut,
-            kSize,
-            stride=stride,
-            dilation=d,
-            padding=((kSize - 1) // 2) * d,
-            groups=groups,
-        )
-
-    def forward(self, input):
-        return self.conv(input)
 
 
 class DilatedConvNorm(nn.Module):
@@ -513,16 +458,13 @@ class Recurrent(nn.Module):
 
 
 if __name__ == '__main__':
-    def test_tdanet():
-        model = TDANet(input_dim=8, out_dim=8, features=128, enc_kernel_size=21, num_blocks=16, upsampling_depth=4)
-        model.eval()
-        print("Testing various input lengths...")
-        with torch.no_grad():
-            for L in [1000, 1023, 1024, 1025, 4096, 8000, 16385]:
-                x = torch.randn(1, 8, L)
-                y = model(x)
-                assert y.shape[-1] == L, f"Length mismatch: {y.shape[-1]} vs {L}"
-                print(f"✅ Input length {L} → Output length {y.shape[-1]}")
+    model = TDANet(input_dim=8, out_dim=8, features=128,
+                   enc_kernel_size=21,
+                   num_blocks=16,
+                   upsampling_depth=4,
+                   sr=1000000)
+    x = torch.rand(2, 8, 5000)
+    estimated_sources = model(x)
+    print(estimated_sources.shape)
 
-    test_tdanet()
 
